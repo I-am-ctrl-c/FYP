@@ -9,7 +9,7 @@ target_fps: 25             # 统一帧率（用于 mask；导出时也会重采�
 global_seed: 230519        # 稳定随机种子
 train_csv: train.csv       # 训练列表（相对仓库根）
 output_dir: "data/preTrainingData/videoClip"   # 输出根目录（相对仓库根）
-
+enable_slice: false
 # 并行度说明（不写在 YAML，用环境变量控制）：
 #   切片并行：  CLIP_WORKERS       （默认 = CPU核数-1）
 #   ROI并行：   LIP_NPY_WORKERS    （默认 = CPU核数-1）
@@ -18,11 +18,13 @@ output_dir: "data/preTrainingData/videoClip"   # 输出根目录（相对仓库�
 # Stage-2 唇 ROI（可选）
 # =========================
 enable_lip_stage: true      # 是否执行唇部ROI（仿射对齐→.npy）
-lip_roi_size: 96            # ROI 尺寸（96 或 112；训练若走灰度可后处理）
+lip_roi_size: 96            # ROI 基准尺寸（若未提供下方宽高，则使用该方形尺寸）
+# 指定非正方形 ROI 宽高（像素）。两者均>0 时生效，否则回退到 lip_roi_size。
+lip_roi_width: 100
+lip_roi_height: 60
 lip_ema_alpha_mat: 0.35     # 对 2x3 相似变换矩阵做 EMA 平滑系数（0=不平滑，1=只用当前帧）
-lip_min_conf: 0.20          # 关键点最小置信（mediapipe 有效；face-alignment 恒为 1.0）
 lip_keep_meta: true         # 是否保存 lip_meta.json（逐帧 warp/ok/conf，便于数据清洗）
-
+debug_lip_detection: false
 # ============ 可选高级项（按需启用，代码里已有默认逻辑） ============
 # 下两项只是“占位注释”，当前实现通过环境变量调度；如要转成配置读写，可在代码里接入：
 # clip_workers: 0           # 0 表示自动（= CPU核数-1），>0 指定固定并行度

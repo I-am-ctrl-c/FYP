@@ -26,14 +26,12 @@ import cv2
 import numpy as np
 import concurrent.futures
 from concurrent.futures import as_completed
+from lip_cropper import crop_lip_from_video_file
 
 # -----------------------------
 # 通用：配置 & 工具
 # -----------------------------
-def load_config(filename: str = "pipline_config.yaml") -> dict:
-    cfg_path = Path(__file__).resolve().parent / filename
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+
 
 def get_video_time(video_path: str) -> float:
     try:
@@ -148,8 +146,6 @@ def export_clip(
 
 # -----------------------------
 # Stage-1：单视频 worker（并行）
-# 输入：train.csv 中的一条原始视频名字符串（如 s11/...）
-# 输出：该视频对应的切片记录列表 & 掩码字典（仅包含该视频生成的条目）
 # -----------------------------
 def _worker_slice_single_video(args) -> Tuple[List[Dict], Dict[str, Dict], str]:
     (
@@ -172,9 +168,7 @@ def _worker_slice_single_video(args) -> Tuple[List[Dict], Dict[str, Dict], str]:
     masks_dict: Dict[str, Dict] = {}
 
     try:
-        # 原视频绝对路径
         src_path = utils.get_origin_video_path_str(video_name)
-
         total = get_video_time(src_path)
         if total <= 0:
             return records, masks_dict, f"[skip] 视频不可读或时长为0：{src_path}"
@@ -238,99 +232,10 @@ def _worker_slice_single_video(args) -> Tuple[List[Dict], Dict[str, Dict], str]:
 # =========================================================
 # Stage-2（可选）：唇 ROI 对齐裁切（五点相似变换 → .npy）
 # =========================================================
-
-# 后端优先 face_alignment，其次 mediapipe（至少安装一个；只跑切片可不装）
-USE_FACE_ALIGNMENT = True
-try:
-    import face_alignment  # type: ignore
-except Exception:
-    USE_FACE_ALIGNMENT = False
-
-try:
-    import mediapipe as mp  # type: ignore
-    _MP_OK = True
-except Exception:
-    _MP_OK = False
-
-DLIB_68 = {
-    "left_eye_outer": 36,
-    "right_eye_outer": 45,
-    "nose_tip": 30,
-    "mouth_left": 48,
-    "mouth_right": 54,
-    "mouth_all": list(range(48, 68)),
-}
-CANVAS = 256
-TEMPLATE_5 = np.array([
-    [85, 110],
-    [171, 110],
-    [128, 150],
-    [98, 190],
-    [158, 190],
-], dtype=np.float32)
-
-def _mouth_center() -> Tuple[int, int]:
-    ml = TEMPLATE_5[3]; mr = TEMPLATE_5[4]
-    return int(round((ml[0]+mr[0])/2.0)), int(round((ml[1]+mr[1])/2.0))
-
-def _ema_np(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
-    if prev is None: return cur.copy()
-    return prev*(1.0-alpha) + cur*alpha
-
-class LandmarkDetector:
-    """在子进程内初始化，避免 pickling 错误"""
-    def __init__(self):
-        self.backend = None
-        self._fa = None
-        self._mp_ctx = None
-        if USE_FACE_ALIGNMENT:
-            try:
-                import face_alignment as fa
-                self._fa = fa.FaceAlignment(fa.LandmarksType._2D, flip_input=False, device='cpu')
-                self.backend = "face_alignment"
-            except Exception:
-                self._fa = None
-        if self._fa is None and _MP_OK:
-            import mediapipe as mp
-            self._mp_ctx = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False, max_num_faces=1, refine_landmarks=True,
-                min_detection_confidence=0.5, min_tracking_confidence=0.5
-            )
-            self.backend = "mediapipe"
-        if self.backend is None:
-            raise RuntimeError("唇ROI阶段需要安装 face-alignment 或 mediapipe 至少一个。")
-
-    def detect_5pts(self, frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
-        """返回 5 点（两眼外角、鼻尖、两嘴角）与 conf；失败返回 (None,0.0)"""
-        h, w = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        if self.backend == "face_alignment":
-            preds = self._fa.get_landmarks(rgb)
-            if preds is None or len(preds) == 0:
-                return None, 0.0
-            lms = preds[0].astype(np.float32)
-            five = np.stack([
-                lms[DLIB_68["left_eye_outer"]],
-                lms[DLIB_68["right_eye_outer"]],
-                lms[DLIB_68["nose_tip"]],
-                lms[DLIB_68["mouth_left"]],
-                lms[DLIB_68["mouth_right"]],
-            ], axis=0).astype(np.float32)
-            return five, 1.0
-        # mediapipe
-        res = self._mp_ctx.process(rgb)
-        if not res.multi_face_landmarks:
-            return None, 0.0
-        fl = res.multi_face_landmarks[0].landmark
-        # 眼角33/263，鼻尖1，嘴角61/291
-        idxs = [33,263,1,61,291]
-        five = np.array([[fl[i].x*w, fl[i].y*h] for i in idxs], dtype=np.float32)
-        confs = [getattr(fl[i], "visibility", 0.5) for i in idxs]
-        return five, float(np.mean(confs))
-
 def _worker_lip_from_clip(args) -> Tuple[Optional[Dict], Optional[Tuple[str, Dict]], str]:
     """
     子进程：对单个 clip 做五点对齐→裁唇→保存 .npy
+    (通过调用 lip_cropper.py 中的函数实现)
     返回：(index_row, (rel_out, meta), status)
     """
     (
@@ -338,9 +243,11 @@ def _worker_lip_from_clip(args) -> Tuple[Optional[Dict], Optional[Tuple[str, Dic
         repo_root_str,
         out_dir_lip_npy_str,
         roi_size,
+        roi_w,
+        roi_h,
         ema_alpha_mat,
-        min_conf,
         keep_meta,
+        debug_output_dir,  # New
     ) = args
 
     clip_path = Path(clip_path_str)
@@ -349,61 +256,55 @@ def _worker_lip_from_clip(args) -> Tuple[Optional[Dict], Optional[Tuple[str, Dic
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        det = LandmarkDetector()
-        cap = cv2.VideoCapture(str(clip_path))
-        if not cap.isOpened():
-            return None, None, f"[err] 无法打开切片：{clip_path}"
+        # 调用外部模块进行核心处理
+        # 允许矩形 ROI：通过 roi_wh 传入（若与 roi_size 相等，则为方形）
+        arr, meta = crop_lip_from_video_file(
+            video_path=str(clip_path),
+            roi_size=roi_size,
+            ema_alpha=ema_alpha_mat,
+            debug_output_dir=debug_output_dir,  # New
+            roi_wh=(int(roi_w), int(roi_h)),
+        )
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        cx_t, cy_t = _mouth_center()
-        half = roi_size // 2
-        ema_mat: Optional[np.ndarray] = None
-        frames = []
-        meta = {"frames":0, "fps":float(fps), "roi_size":int(roi_size), "method":det.backend}
-        if keep_meta: meta["per_frame"] = []
+        if arr is None or len(arr) == 0:
+            return None, None, f"[err] 唇ROI处理返回空结果: {clip_path}"
 
-        while True:
-            ret, frame = cap.read()
-            if not ret: break
-            five, conf = det.detect_5pts(frame)
-            if five is None or conf < float(min_conf):
-                M = np.array([[1,0,0],[0,1,0]], dtype=np.float32)
-            else:
-                M_est, _ = cv2.estimateAffinePartial2D(five, TEMPLATE_5, method=cv2.LMEDS)
-                if M_est is None:
-                    M_est = np.array([[1,0,0],[0,1,0]], dtype=np.float32)
-                M = _ema_np(ema_mat, M_est, float(ema_alpha_mat))
-            ema_mat = M.copy()
-
-            aligned = cv2.warpAffine(frame, M, (CANVAS, CANVAS), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            x1 = max(0, cx_t - half); y1 = max(0, cy_t - half)
-            x2 = min(CANVAS, cx_t + half); y2 = min(CANVAS, cy_t + half)
-            crop = aligned[y1:y2, x1:x2]
-            if crop.shape[:2] != (roi_size, roi_size):
-                crop = cv2.resize(crop, (roi_size, roi_size), interpolation=cv2.INTER_LINEAR)
-            frames.append(crop)
-            if keep_meta:
-                meta["per_frame"].append({"ok": five is not None and conf>=float(min_conf),
-                                          "conf": float(conf),
-                                          "warp": M.astype(np.float32).tolist()})
-            meta["frames"] += 1
-
-        cap.release()
-        if not frames:
-            return None, None, f"[err] 空视频（无帧）：{clip_path}"
-
-        arr = np.stack(frames, axis=0)  # [T,H,W,C]
-        out_name = f"{clip_path.stem}_lip{roi_size}.npy"
+        # 保存 .npy 文件
+        if int(roi_w) == int(roi_h) == int(roi_size):
+            out_name = f"{clip_path.stem}_lip{roi_size}.npy"
+        else:
+            out_name = f"{clip_path.stem}_lip{int(roi_w)}x{int(roi_h)}.npy"
         out_path = out_dir / out_name
         np.save(out_path, arr)
 
+        # 准备返回的元数据
         rel_clip = clip_path.relative_to(repo_root).as_posix()
         rel_out = out_path.relative_to(repo_root).as_posix()
-        index_row = {"clip_path": rel_clip, "roi_path": rel_out, "frames": meta["frames"], "fps": meta["fps"], "roi_size": roi_size}
-        return index_row, (rel_out, meta if keep_meta else {}), "OK"
+        
+        final_meta = {
+            "frames": meta.get("frames", 0),
+            "fps": meta.get("fps", 25.0),
+            "roi_size": meta.get("roi_size", roi_size),
+            "roi_wh": meta.get("roi_wh", [int(roi_w), int(roi_h)]),
+            "method": meta.get("method", "unknown"),
+        }
+        if keep_meta:
+            final_meta["per_frame"] = meta.get("per_frame", [])
+
+        index_row = {
+            "clip_path": rel_clip,
+            "roi_path": rel_out,
+            "frames": final_meta["frames"],
+            "fps": final_meta["fps"],
+            "roi_size": roi_size,
+        }
+        
+        meta_to_return = (rel_out, final_meta if keep_meta else {})
+        
+        return index_row, meta_to_return, "OK"
 
     except Exception as e:
-        return None, None, f"[err] 唇ROI失败：{clip_path} | {e}"
+        return None, None, f"[err] 唇ROI失败: {clip_path} | {e}"
 
 # -----------------------------
 # Orchestrator
@@ -453,8 +354,7 @@ def run_stage1_slice_parallel(config: dict) -> Tuple[List[Dict], Dict[str, Dict]
             if done % 10 == 0 or done == total:
                 print(f"[stage-1] 进度：{done}/{total}")
 
-    # 输出 CSV / JSON
-    csv_path = OUTPUT_DIR / "clipvideo.csv"
+    csv_path = OUTPUT_DIR / "clip_video.csv"
     json_path = OUTPUT_DIR / "clip_masks.json"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["idx", "clip_path", "original_name", "duration_sec"])
@@ -475,20 +375,43 @@ def run_stage2_lip_parallel(config: dict) -> None:
     out_dir_lip_npy.mkdir(parents=True, exist_ok=True)
 
     ROI_SIZE = int(config.get("lip_roi_size", 96))
+    ROI_W = int(config.get("lip_roi_width", 0))
+    ROI_H = int(config.get("lip_roi_height", 0))
+    if ROI_W <= 0 or ROI_H <= 0:
+        ROI_W, ROI_H = ROI_SIZE, ROI_SIZE
     EMA_ALPHA_MAT = float(config.get("lip_ema_alpha_mat", 0.35))
-    MIN_CONF = float(config.get("lip_min_conf", 0.2))
     KEEP_META = bool(config.get("lip_keep_meta", True))
+    
+    DEBUG_LIP_DETECTION = bool(config.get("debug_lip_detection", False))
+    DEBUG_OUTPUT_DIR = REPO_ROOT / "debug_output/lip_detection" if DEBUG_LIP_DETECTION else None
+    if DEBUG_OUTPUT_DIR:
+        DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"[debug] 唇部检测调试模式已开启，图像将保存至: {DEBUG_OUTPUT_DIR}")
 
     clip_paths = sorted(video_dir.glob("*.mp4"))
     if not clip_paths:
         print(f"[warn] Stage-2：未找到切片：{video_dir} 下没有 .mp4")
         return
+        
+    if DEBUG_LIP_DETECTION:
+        print(f"[debug] 将只处理第一个视频切片进行调试: {clip_paths[0]}")
+        clip_paths = clip_paths[:1]
 
     env_workers = int(os.environ.get("LIP_NPY_WORKERS", "0") or "0")
     num_workers = env_workers if env_workers > 0 else max(1, (os.cpu_count() or 4) - 1)
 
     jobs = [
-        (str(p), str(REPO_ROOT), str(out_dir_lip_npy), ROI_SIZE, EMA_ALPHA_MAT, MIN_CONF, KEEP_META)
+        (
+            str(p),
+            str(REPO_ROOT),
+            str(out_dir_lip_npy),
+            ROI_SIZE,
+            ROI_W,
+            ROI_H,
+            EMA_ALPHA_MAT,
+            KEEP_META,
+            str(DEBUG_OUTPUT_DIR) if DEBUG_OUTPUT_DIR else None,
+        )
         for p in clip_paths
     ]
     lip_index_csv = OUTPUT_DIR / "lip_index.csv"
@@ -525,20 +448,3 @@ def run_stage2_lip_parallel(config: dict) -> None:
         with open(lip_meta_json, "w", encoding="utf-8") as f:
             json.dump(meta_all, f, ensure_ascii=False)
         print(f"[info] 写出：{lip_meta_json}（keys={len(meta_all)}）")
-
-# -----------------------------
-# main
-# -----------------------------
-def main():
-    config = load_config()
-    # Stage-1：并行切片
-    run_stage1_slice_parallel(config)
-
-    # Stage-2：是否开启唇ROI（可在 config 里开关）
-    if bool(config.get("enable_lip_stage", True)):
-        run_stage2_lip_parallel(config)
-    else:
-        print("[info] 已跳过 Stage-2（enable_lip_stage = false）")
-
-if __name__ == "__main__":
-    main()
