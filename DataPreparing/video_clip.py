@@ -18,15 +18,24 @@ import hashlib
 import random
 import csv
 import yaml
+import sys
 import ffmpeg
-import utils
 import json
 import os
 import cv2
 import numpy as np
 import concurrent.futures
+import multiprocessing as mp
 from concurrent.futures import as_completed
 from lip_cropper import crop_lip_from_video_file
+import lip_cropper
+
+# Ensure repository root is importable so sibling modules like `utils` resolve.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import utils
 
 # -----------------------------
 # 通用：配置 & 工具
@@ -256,6 +265,8 @@ def _worker_lip_from_clip(args) -> Tuple[Optional[Dict], Optional[Tuple[str, Dic
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        pid = os.getpid()
+        print(f"[stage-2][pid={pid}] start: {clip_path.name}")
         # 调用外部模块进行核心处理
         # 允许矩形 ROI：通过 roi_wh 传入（若与 roi_size 相等，则为方形）
         arr, meta = crop_lip_from_video_file(
@@ -276,6 +287,9 @@ def _worker_lip_from_clip(args) -> Tuple[Optional[Dict], Optional[Tuple[str, Dic
             out_name = f"{clip_path.stem}_lip{int(roi_w)}x{int(roi_h)}.npy"
         out_path = out_dir / out_name
         np.save(out_path, arr)
+        print(
+            f"[stage-2][pid={pid}] saved: {out_path.name} frames={arr.shape[0]} backend={meta.get('method','?')}"
+        )
 
         # 准备返回的元数据
         rel_clip = clip_path.relative_to(repo_root).as_posix()
@@ -301,6 +315,7 @@ def _worker_lip_from_clip(args) -> Tuple[Optional[Dict], Optional[Tuple[str, Dic
         
         meta_to_return = (rel_out, final_meta if keep_meta else {})
         
+        print(f"[stage-2][pid={pid}] done: {clip_path.name}")
         return index_row, meta_to_return, "OK"
 
     except Exception as e:
@@ -336,7 +351,7 @@ def run_stage1_slice_parallel(config: dict) -> Tuple[List[Dict], Dict[str, Dict]
     ]
     env_workers = int(os.environ.get("CLIP_WORKERS", "0") or "0")
     num_workers = env_workers if env_workers > 0 else max(1, (os.cpu_count() or 4) - 1)
-
+    num_workers = 8
     all_records: List[Dict] = []
     all_masks: Dict[str, Dict] = {}
 
@@ -399,7 +414,7 @@ def run_stage2_lip_parallel(config: dict) -> None:
 
     env_workers = int(os.environ.get("LIP_NPY_WORKERS", "0") or "0")
     num_workers = env_workers if env_workers > 0 else max(1, (os.cpu_count() or 4) - 1)
-
+    num_workers = 8
     jobs = [
         (
             str(p),
@@ -421,22 +436,59 @@ def run_stage2_lip_parallel(config: dict) -> None:
 
     print(f"[info] Stage-2 唇ROI：{len(jobs)} 个切片，并行启动（workers={num_workers}）…")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as ex:
-        futures = [ex.submit(_worker_lip_from_clip, job) for job in jobs]
+    # 通过 initializer 让每个 worker 进程预先构造并缓存一次检测器，避免按任务反复初始化
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=lip_cropper.init_detector_for_worker,
+        mp_context=mp.get_context("spawn"),
+    ) as ex:
+        # 采用“限流提交”策略，避免一次性提交几十万任务导致父进程/管道阻塞
+        job_iter = iter(jobs)
+        inflight_limit = max(8, num_workers * 4)
+        future_to_clip: Dict[concurrent.futures.Future, str] = {}
+        total = len(jobs)
         done = 0
-        total = len(futures)
-        for fut in as_completed(futures):
-            index_row, meta_tuple, status = fut.result()
-            if status == "OK" and index_row:
-                index_rows.append(index_row)
-                if KEEP_META and meta_tuple:
-                    rel_out, meta = meta_tuple
-                    meta_all[rel_out] = meta
-            else:
-                print(status)
-            done += 1
-            if done % 20 == 0 or done == total:
-                print(f"[stage-2] 进度：{done}/{total}")
+
+        def submit_until_full():
+            nonlocal future_to_clip
+            while len(future_to_clip) < inflight_limit:
+                try:
+                    job = next(job_iter)
+                except StopIteration:
+                    break
+                fut = ex.submit(_worker_lip_from_clip, job)
+                future_to_clip[fut] = Path(job[0]).stem
+
+        submit_until_full()
+
+        while future_to_clip:
+            # 等待至少一个完成，再继续补充
+            done_set, _ = concurrent.futures.wait(
+                future_to_clip.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done_set:
+                clip_name = future_to_clip.pop(fut)
+                try:
+                    index_row, meta_tuple, status = fut.result()
+                except Exception as exc:
+                    print(f"[stage-2][{clip_name}] 子进程异常：{exc}")
+                    status = "EXCEPTION"
+                    index_row = None
+                    meta_tuple = None
+
+                if status == "OK" and index_row:
+                    index_rows.append(index_row)
+                    if KEEP_META and meta_tuple:
+                        rel_out, meta = meta_tuple
+                        meta_all[rel_out] = meta
+                else:
+                    print(f"[stage-2][{clip_name}] {status}")
+
+                done += 1
+                if done % 10 == 0 or done == total:
+                    print(f"--------- [stage-2] 进度：{done}/{total}（当前完成：{clip_name}）")
+
+            submit_until_full()
 
     with open(lip_index_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["clip_path", "roi_path", "frames", "fps", "roi_size"])

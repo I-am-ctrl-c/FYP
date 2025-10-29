@@ -3,9 +3,23 @@
 从视频文件中提取、对齐并裁切唇部 ROI（稳健版：相似变换 + 失败回退 + 参数空间EMA）。
 """
 from typing import Optional, Tuple, List
+import os
 from pathlib import Path
 import numpy as np
 import cv2
+
+# 限制并行库默认线程数，避免多进程×多线程导致资源竞争/卡顿（可被外部覆盖）
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+try:
+    if hasattr(cv2, "ocl"):
+        cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 
 # 后端优先 face_alignment，其次 mediapipe
 USE_FACE_ALIGNMENT = True
@@ -137,6 +151,20 @@ class LandmarkDetector:
         if self.backend is None:
             raise RuntimeError("唇ROI阶段需要安装 face-alignment 或 mediapipe 至少一个。")
 
+    def close(self) -> None:
+        """释放底层资源，避免在子进程中残留线程阻塞退出（特别是 MediaPipe）。"""
+        try:
+            if self.backend == "mediapipe" and self._mp_ctx is not None:
+                try:
+                    # MediaPipe Solution 支持显式关闭
+                    self._mp_ctx.close()
+                except Exception:
+                    pass
+                finally:
+                    self._mp_ctx = None
+        except Exception:
+            pass
+
     def detect_5pts(self, frame_bgr: np.ndarray, output_path: Optional[str] = None) -> Tuple[
         Optional[np.ndarray], float]:
         """返回 5 点（两眼外角、鼻尖、两嘴角）与 conf；失败返回 (None,0.0)。无论成功与否，若给了 output_path，就落一张调试图。"""
@@ -186,6 +214,32 @@ class LandmarkDetector:
         return five, conf
 
 
+# ------- 进程内单例缓存，避免每个任务重复初始化后端 -------
+_CACHED_DETECTOR: Optional[LandmarkDetector] = None
+
+def _get_or_create_detector() -> LandmarkDetector:
+    global _CACHED_DETECTOR
+    if _CACHED_DETECTOR is None:
+        _CACHED_DETECTOR = LandmarkDetector()
+    return _CACHED_DETECTOR
+
+def _release_cached_detector() -> None:
+    global _CACHED_DETECTOR
+    if _CACHED_DETECTOR is not None:
+        try:
+            _CACHED_DETECTOR.close()
+        except Exception:
+            pass
+        _CACHED_DETECTOR = None
+
+# 供多进程初始化器调用：在 worker 启动时预热 Detector
+def init_detector_for_worker() -> None:
+    _get_or_create_detector()
+
+# 供需要时显式释放（通常不必，进程退出会回收）
+def release_detector_for_worker() -> None:
+    _release_cached_detector()
+
 # ------- 主流程：相似变换 + 回退 + 参数EMA -------
 
 def crop_lip_from_video_file(
@@ -195,6 +249,7 @@ def crop_lip_from_video_file(
     debug_output_dir: Optional[str] = None,
     roi_wh: Optional[Tuple[int, int]] = None,
     pause_each_frame: bool = False,   # 新增调试开关（默认连续播放）
+    use_cached_detector: bool = True, # 进程内共享 Detector，避免频繁构造
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     从单个视频文件中裁切唇部 ROI 序列（稳健版）：
@@ -203,8 +258,8 @@ def crop_lip_from_video_file(
     - 在 (scale, theta, tx, ty) 参数空间进行 EMA 平滑。
     """
     try:
-        # 1) 初始化
-        det = LandmarkDetector()
+        # 1) 初始化（默认复用进程内单例，避免频繁初始化导致的卡顿/资源竞争）
+        det = _get_or_create_detector() if use_cached_detector else LandmarkDetector()
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频：{video_path}")
@@ -298,8 +353,14 @@ def crop_lip_from_video_file(
                 # 裁剪框（黄）
                 cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 255), 1)
 
-                cv2.imshow("Aligned Frame", dbg)
-                cv2.waitKey(0 if pause_each_frame else 1)
+                # 在多进程环境下避免使用 HighGUI 窗口，防止卡死；仅在逐帧暂停调试时显示。
+                if pause_each_frame:
+                    try:
+                        cv2.imshow("Aligned Frame", dbg)
+                        cv2.waitKey(0)
+                    except Exception:
+                        pass
+
                 cv2.imwrite(str(dbg_dir / f"{video_name}_aligned_{idx:04d}.png"), dbg)
 
             # 6) 记录 & 收集
@@ -310,7 +371,18 @@ def crop_lip_from_video_file(
 
         # 7) 结束
         cap.release()
-        cv2.destroyAllWindows()
+        # 若未使用缓存，则为该任务独占实例，安全关闭；否则交由进程退出或外部显式释放
+        if not use_cached_detector:
+            try:
+                det.close()
+            except Exception:
+                pass
+        # 仅在调试显示时销毁窗口，避免在无窗口环境/子进程中卡住
+        if pause_each_frame:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
         if not frames:
             return None, meta
