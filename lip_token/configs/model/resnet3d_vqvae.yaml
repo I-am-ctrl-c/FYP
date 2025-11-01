@@ -1,0 +1,21 @@
+encoder:
+  embedding_dim: 256
+  in_channels: 3
+  pretrained: false
+  freeze_bn: true
+quantizer:
+  codebook_size: 512
+  embedding_dim: 256
+  commitment_beta: 0.25
+  decay: 0.99
+decoder:
+  hidden_dims: [256, 128, 64]
+  output_channels: 3
+  upsample_scales:
+    - [1, 2, 2]
+    - [1, 2, 2]
+    - [2, 2, 2]
+  final_activation: true
+recon_loss: mse
+beta: 0.25
+gamma: 1.0

@@ -1,0 +1,8 @@
+defaults:
+  - data: default
+  - model: resnet3d_vqvae
+  - train: default
+
+experiment:
+  name: m0_vqvae
+

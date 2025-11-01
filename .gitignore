@@ -209,6 +209,7 @@ __marimo__/
 =======
 data/*
 .idea/*
+lip_token/outputs/*
 DataPreparing/data/CMLRdataset/*
 */*.pyc
 *.pyc

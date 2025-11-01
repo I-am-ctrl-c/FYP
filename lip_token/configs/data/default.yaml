@@ -1,0 +1,21 @@
+# If your manifests live under the project-level data/ (recommended in your current tree),
+# keep these as ../data/*.csv. If you moved them into lip_token/data/, switch to ./data/*.csv.
+train_manifest: ../data/CMLRdataset/train.csv
+valid_manifest: ../data/CMLRdataset/val.csv
+test_manifest: ../data/CMLRdataset/test.csv
+backend: decord
+T: 16
+H: 112
+W: 112
+batch_size: 48
+num_workers: 8
+stride: 1
+random_crop: true
+horizontal_flip: 0.5
+temporal_jitter: true
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
+# For CMLR-style single-column CSVs (no header), the loader derives paths
+# automatically; these keys are ignored. If you have a headered CSV, set:
+# video_column: video_path
+# id_column: utt_id

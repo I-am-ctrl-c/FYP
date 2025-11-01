@@ -1,0 +1,18 @@
+epochs: 30
+lr: 0.00003
+weight_decay: 0.01
+grad_clip: 1.0
+amp: true
+amp_start_epoch: 3
+save_dir: ./outputs/m0_vqvae
+log_interval: 200
+val_interval: 1
+seed: 42
+num_devices: 1
+tensorboard: true
+tb_log_dir: ./outputs/m0_vqvae/tb
+scheduler:
+  name: piecewise
+  params:
+    milestones: [2, 5]
+    lrs: [0.00003, 0.00005, 0.0001]
