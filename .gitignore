@@ -5,3 +5,4 @@ DataPreparing/data/CMLRdataset/*
 *.pyc
 */__pycache__/*
 __pycache__/utils.cpython-312.pyc
+debug_output/npy_to_png/*
